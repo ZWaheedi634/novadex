@@ -90,7 +90,6 @@ AMM · DEX · Smart Contracts
 ---
 
 ## Netlify Site Description
-```
+
 NovaDEX — Decentralized Exchange on Robinhood Chain Testnet
-```
 
