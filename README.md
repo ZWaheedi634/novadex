@@ -81,8 +81,6 @@ open index.html
 MIT
 ```
 
----
-
 ## GitHub Profile Bio
 ```
 Solidity Developer · Building DeFi on Robinhood Chain · 
@@ -96,20 +94,3 @@ AMM · DEX · Smart Contracts
 NovaDEX — Decentralized Exchange on Robinhood Chain Testnet
 ```
 
----
-
-## Twitter/X Bio (if you post about it)
-```
-Just deployed a full Uniswap V2-style AMM DEX on 
-Robinhood Chain Testnet from scratch.
-
-Factory + Router + Pair architecture
-0.3% swap fee
-LP token minting
-TWAP oracle
-Single Solidity file
-
-Live → novadex.netlify.app
-Code → github.com/you/novadex
-
-#Robinhood #DeFi #Solidity #Web3
