@@ -1,15 +1,472 @@
-# Remix compiler artifacts
-**/artifacts/
-**/artifacts/**
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
 
-# Remix plugin state folders
-deps/
-states/
+// ============================================================
+//  ROBINHOOD DEX — Uniswap V2-style AMM
+//  Deploy order: 1) RobinhoodFactory  2) RobinhoodRouter
+//  Pair contracts are created automatically by the Factory
+// ============================================================
 
-# Debug info
-*.dbg.json
-*.tsbuildinfo
+// ─────────────────────────────────────────────────────────────
+// SECTION 1: ERC20 BASE (used by LP tokens)
+// ─────────────────────────────────────────────────────────────
+contract ERC20Base {
+    string  public name;
+    string  public symbol;
+    uint8   public decimals = 18;
+    uint256 public totalSupply;
 
-# Optional
-.env
-.env.local
+    mapping(address => uint256)                     public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    function _mint(address to, uint256 amount) internal {
+        totalSupply       += amount;
+        balanceOf[to]     += amount;
+        emit Transfer(address(0), to, amount);
+    }
+
+    function _burn(address from, uint256 amount) internal {
+        totalSupply       -= amount;
+        balanceOf[from]   -= amount;
+        emit Transfer(from, address(0), amount);
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to]         += amount;
+        emit Transfer(msg.sender, to, amount);
+        return true;
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        emit Approval(msg.sender, spender, amount);
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        if (allowance[from][msg.sender] != type(uint256).max)
+            allowance[from][msg.sender] -= amount;
+        balanceOf[from] -= amount;
+        balanceOf[to]   += amount;
+        emit Transfer(from, to, amount);
+        return true;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// SECTION 2: MATH LIBRARY
+// ─────────────────────────────────────────────────────────────
+library Math {
+    function min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
+    }
+
+    // Babylonian square root
+    function sqrt(uint256 y) internal pure returns (uint256 z) {
+        if (y > 3) {
+            z = y;
+            uint256 x = y / 2 + 1;
+            while (x < z) { z = x; x = (y / x + x) / 2; }
+        } else if (y != 0) {
+            z = 1;
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// SECTION 3: PAIR CONTRACT (LP token + AMM logic)
+// ─────────────────────────────────────────────────────────────
+interface IERC20 {
+    function balanceOf(address) external view returns (uint256);
+    function transfer(address, uint256) external returns (bool);
+    function transferFrom(address, address, uint256) external returns (bool);
+}
+
+contract RobinhoodPair is ERC20Base {
+    uint256 public constant MINIMUM_LIQUIDITY = 1000;
+    uint256 private constant FEE_NUMERATOR    = 997;   // 0.3% fee
+    uint256 private constant FEE_DENOMINATOR  = 1000;
+
+    address public factory;
+    address public token0;
+    address public token1;
+
+    uint112 private reserve0;
+    uint112 private reserve1;
+    uint32  private blockTimestampLast;
+
+    uint256 public price0CumulativeLast;
+    uint256 public price1CumulativeLast;
+    uint256 public kLast;
+
+    bool private locked;
+
+    event Mint(address indexed sender, uint256 amount0, uint256 amount1);
+    event Burn(address indexed sender, uint256 amount0, uint256 amount1, address indexed to);
+    event Swap(address indexed sender, uint256 in0, uint256 in1, uint256 out0, uint256 out1, address indexed to);
+    event Sync(uint112 reserve0, uint112 reserve1);
+
+    modifier lock() {
+        require(!locked, "LOCKED");
+        locked = true;
+        _;
+        locked = false;
+    }
+
+    constructor() {
+        factory = msg.sender;
+        name    = "Robinhood LP Token";
+        symbol  = "RHD-LP";
+    }
+
+    function initialize(address _token0, address _token1) external {
+        require(msg.sender == factory, "FORBIDDEN");
+        token0 = _token0;
+        token1 = _token1;
+    }
+
+    function getReserves() public view returns (uint112 _r0, uint112 _r1, uint32 _ts) {
+        _r0 = reserve0;
+        _r1 = reserve1;
+        _ts = blockTimestampLast;
+    }
+
+    function _update(uint256 bal0, uint256 bal1, uint112 _r0, uint112 _r1) private {
+        require(bal0 <= type(uint112).max && bal1 <= type(uint112).max, "OVERFLOW");
+        uint32 ts = uint32(block.timestamp % 2**32);
+        uint32 elapsed = ts - blockTimestampLast;
+        if (elapsed > 0 && _r0 != 0 && _r1 != 0) {
+            price0CumulativeLast += uint256((uint224(_r1) * 2**112) / uint224(_r0)) * elapsed;
+            price1CumulativeLast += uint256((uint224(_r0) * 2**112) / uint224(_r1)) * elapsed;
+        }
+        reserve0           = uint112(bal0);
+        reserve1           = uint112(bal1);
+        blockTimestampLast = ts;
+        emit Sync(reserve0, reserve1);
+    }
+
+    /// @notice Add liquidity — tokens must be transferred here before calling
+    function mint(address to) external lock returns (uint256 liquidity) {
+        (uint112 _r0, uint112 _r1,) = getReserves();
+        uint256 bal0   = IERC20(token0).balanceOf(address(this));
+        uint256 bal1   = IERC20(token1).balanceOf(address(this));
+        uint256 amount0 = bal0 - _r0;
+        uint256 amount1 = bal1 - _r1;
+        uint256 _total  = totalSupply;
+
+        if (_total == 0) {
+            liquidity = Math.sqrt(amount0 * amount1) - MINIMUM_LIQUIDITY;
+            _mint(address(0xdead), MINIMUM_LIQUIDITY); // lock minimum liquidity forever
+        } else {
+            liquidity = Math.min(
+                (amount0 * _total) / _r0,
+                (amount1 * _total) / _r1
+            );
+        }
+        require(liquidity > 0, "INSUFFICIENT_LIQUIDITY_MINTED");
+        _mint(to, liquidity);
+        _update(bal0, bal1, _r0, _r1);
+        kLast = uint256(reserve0) * reserve1;
+        emit Mint(msg.sender, amount0, amount1);
+    }
+
+    /// @notice Remove liquidity — LP tokens must be transferred here before calling
+    function burn(address to) external lock returns (uint256 amount0, uint256 amount1) {
+        (uint112 _r0, uint112 _r1,) = getReserves();
+        uint256 bal0      = IERC20(token0).balanceOf(address(this));
+        uint256 bal1      = IERC20(token1).balanceOf(address(this));
+        uint256 liquidity = balanceOf[address(this)];
+        uint256 _total    = totalSupply;
+
+        amount0 = (liquidity * bal0) / _total;
+        amount1 = (liquidity * bal1) / _total;
+        require(amount0 > 0 && amount1 > 0, "INSUFFICIENT_LIQUIDITY_BURNED");
+
+        _burn(address(this), liquidity);
+        IERC20(token0).transfer(to, amount0);
+        IERC20(token1).transfer(to, amount1);
+        _update(
+            IERC20(token0).balanceOf(address(this)),
+            IERC20(token1).balanceOf(address(this)),
+            _r0, _r1
+        );
+        kLast = uint256(reserve0) * reserve1;
+        emit Burn(msg.sender, amount0, amount1, to);
+    }
+
+    /// @notice Swap — tokens must be transferred here before calling
+    function swap(uint256 out0, uint256 out1, address to) external lock {
+        require(out0 > 0 || out1 > 0, "INSUFFICIENT_OUTPUT");
+        (uint112 _r0, uint112 _r1,) = getReserves();
+        require(out0 < _r0 && out1 < _r1, "INSUFFICIENT_LIQUIDITY");
+
+        if (out0 > 0) IERC20(token0).transfer(to, out0);
+        if (out1 > 0) IERC20(token1).transfer(to, out1);
+
+        uint256 bal0 = IERC20(token0).balanceOf(address(this));
+        uint256 bal1 = IERC20(token1).balanceOf(address(this));
+
+        uint256 in0 = bal0 > _r0 - out0 ? bal0 - (_r0 - out0) : 0;
+        uint256 in1 = bal1 > _r1 - out1 ? bal1 - (_r1 - out1) : 0;
+        require(in0 > 0 || in1 > 0, "INSUFFICIENT_INPUT");
+
+        // Verify k with fee applied
+        uint256 adj0 = bal0 * FEE_DENOMINATOR - in0 * (FEE_DENOMINATOR - FEE_NUMERATOR);
+        uint256 adj1 = bal1 * FEE_DENOMINATOR - in1 * (FEE_DENOMINATOR - FEE_NUMERATOR);
+        require(adj0 * adj1 >= uint256(_r0) * _r1 * (FEE_DENOMINATOR ** 2), "K_INVARIANT");
+
+        _update(bal0, bal1, _r0, _r1);
+        emit Swap(msg.sender, in0, in1, out0, out1, to);
+    }
+
+    function sync() external lock {
+        _update(
+            IERC20(token0).balanceOf(address(this)),
+            IERC20(token1).balanceOf(address(this)),
+            reserve0, reserve1
+        );
+    }
+}
+
+
+
+// ─────────────────────────────────────────────────────────────
+// SECTION 4: FACTORY
+// ─────────────────────────────────────────────────────────────
+contract RobinhoodFactory {
+    address public feeTo;
+    address public feeToSetter;
+
+    mapping(address => mapping(address => address)) public getPair;
+    address[] public allPairs;
+
+    event PairCreated(address indexed token0, address indexed token1, address pair, uint256 pairCount);
+
+    constructor(address _feeToSetter) {
+        feeToSetter = _feeToSetter;
+    }
+
+    function allPairsLength() external view returns (uint256) {
+        return allPairs.length;
+    }
+
+    function createPair(address tokenA, address tokenB) external returns (address pair) {
+        require(tokenA != tokenB, "IDENTICAL_TOKENS");
+        (address t0, address t1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
+        require(t0 != address(0), "ZERO_ADDRESS");
+        require(getPair[t0][t1] == address(0), "PAIR_EXISTS");
+
+        bytes memory bytecode = type(RobinhoodPair).creationCode;
+        bytes32 salt = keccak256(abi.encodePacked(t0, t1));
+        assembly { pair := create2(0, add(bytecode, 32), mload(bytecode), salt) }
+
+        RobinhoodPair(pair).initialize(t0, t1);
+        getPair[t0][t1] = pair;
+        getPair[t1][t0] = pair;
+        allPairs.push(pair);
+
+        emit PairCreated(t0, t1, pair, allPairs.length);
+    }
+
+    function setFeeTo(address _feeTo) external {
+        require(msg.sender == feeToSetter, "FORBIDDEN");
+        feeTo = _feeTo;
+    }
+
+    function setFeeToSetter(address _feeToSetter) external {
+        require(msg.sender == feeToSetter, "FORBIDDEN");
+        feeToSetter = _feeToSetter;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// SECTION 5: ROUTER (user-facing entry point)
+// ─────────────────────────────────────────────────────────────
+contract RobinhoodRouter {
+    address public immutable factory;
+
+    modifier ensure(uint256 deadline) {
+        require(deadline >= block.timestamp, "EXPIRED");
+        _;
+    }
+
+    constructor(address _factory) {
+        factory = _factory;
+    }
+
+    // ── Internal helpers ──────────────────────────────────────
+
+    function _getPair(address tA, address tB) internal view returns (address) {
+        return RobinhoodFactory(factory).getPair(tA, tB);
+    }
+
+    function _getReserves(address tA, address tB)
+        internal view returns (uint256 rA, uint256 rB)
+    {
+        (address t0,) = tA < tB ? (tA, tB) : (tB, tA);
+        (uint112 r0, uint112 r1,) = RobinhoodPair(_getPair(tA, tB)).getReserves();
+        (rA, rB) = tA == t0 ? (r0, r1) : (r1, r0);
+    }
+
+    function quote(uint256 amtA, uint256 rA, uint256 rB) public pure returns (uint256 amtB) {
+        require(amtA > 0, "INSUFFICIENT_AMOUNT");
+        require(rA > 0 && rB > 0, "INSUFFICIENT_LIQUIDITY");
+        amtB = (amtA * rB) / rA;
+    }
+
+    function getAmountOut(uint256 amtIn, uint256 rIn, uint256 rOut) public pure returns (uint256 amtOut) {
+        require(amtIn > 0, "INSUFFICIENT_INPUT");
+        require(rIn > 0 && rOut > 0, "INSUFFICIENT_LIQUIDITY");
+        uint256 inWithFee = amtIn * 997;
+        amtOut = (inWithFee * rOut) / (rIn * 1000 + inWithFee);
+    }
+
+    function getAmountIn(uint256 amtOut, uint256 rIn, uint256 rOut) public pure returns (uint256 amtIn) {
+        require(amtOut > 0, "INSUFFICIENT_OUTPUT");
+        require(rIn > 0 && rOut > 0, "INSUFFICIENT_LIQUIDITY");
+        amtIn = (rIn * amtOut * 1000) / ((rOut - amtOut) * 997) + 1;
+    }
+
+    function getAmountsOut(uint256 amtIn, address[] memory path)
+        public view returns (uint256[] memory amounts)
+    {
+        require(path.length >= 2, "INVALID_PATH");
+        amounts = new uint256[](path.length);
+        amounts[0] = amtIn;
+        for (uint256 i; i < path.length - 1; i++) {
+            (uint256 rIn, uint256 rOut) = _getReserves(path[i], path[i+1]);
+            amounts[i+1] = getAmountOut(amounts[i], rIn, rOut);
+        }
+    }
+
+    // ── Add Liquidity ─────────────────────────────────────────
+
+    function addLiquidity(
+        address tokenA, address tokenB,
+        uint256 amtADesired, uint256 amtBDesired,
+        uint256 amtAMin,     uint256 amtBMin,
+        address to,          uint256 deadline
+    ) external ensure(deadline) returns (uint256 amtA, uint256 amtB, uint256 liquidity) {
+        address pair = _getPair(tokenA, tokenB);
+        if (pair == address(0)) {
+            pair = RobinhoodFactory(factory).createPair(tokenA, tokenB);
+        }
+
+        (uint256 rA, uint256 rB) = _getReserves(tokenA, tokenB);
+        if (rA == 0 && rB == 0) {
+            (amtA, amtB) = (amtADesired, amtBDesired);
+        } else {
+            uint256 amtBOptimal = quote(amtADesired, rA, rB);
+            if (amtBOptimal <= amtBDesired) {
+                require(amtBOptimal >= amtBMin, "INSUFFICIENT_B");
+                (amtA, amtB) = (amtADesired, amtBOptimal);
+            } else {
+                uint256 amtAOptimal = quote(amtBDesired, rB, rA);
+                require(amtAOptimal >= amtAMin, "INSUFFICIENT_A");
+                (amtA, amtB) = (amtAOptimal, amtBDesired);
+            }
+        }
+
+        IERC20(tokenA).transferFrom(msg.sender, pair, amtA);
+        IERC20(tokenB).transferFrom(msg.sender, pair, amtB);
+        liquidity = RobinhoodPair(pair).mint(to);
+    }
+
+    // ── Remove Liquidity ──────────────────────────────────────
+
+    function removeLiquidity(
+        address tokenA, address tokenB,
+        uint256 liquidity,
+        uint256 amtAMin, uint256 amtBMin,
+        address to,      uint256 deadline
+    ) external ensure(deadline) returns (uint256 amtA, uint256 amtB) {
+        address pair = _getPair(tokenA, tokenB);
+        IERC20(pair).transferFrom(msg.sender, pair, liquidity);
+        (uint256 amt0, uint256 amt1) = RobinhoodPair(pair).burn(to);
+        (address t0,) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
+        (amtA, amtB)  = tokenA == t0 ? (amt0, amt1) : (amt1, amt0);
+        require(amtA >= amtAMin, "INSUFFICIENT_A");
+        require(amtB >= amtBMin, "INSUFFICIENT_B");
+    }
+
+    // ── Swap ──────────────────────────────────────────────────
+
+    function swapExactTokensForTokens(
+        uint256 amtIn,
+        uint256 amtOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external ensure(deadline) returns (uint256[] memory amounts) {
+        amounts = getAmountsOut(amtIn, path);
+        require(amounts[amounts.length - 1] >= amtOutMin, "INSUFFICIENT_OUTPUT");
+
+        IERC20(path[0]).transferFrom(
+            msg.sender,
+            _getPair(path[0], path[1]),
+            amounts[0]
+        );
+        _swap(amounts, path, to);
+    }
+
+    function swapTokensForExactTokens(
+        uint256 amtOut,
+        uint256 amtInMax,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external ensure(deadline) returns (uint256[] memory amounts) {
+        require(path.length >= 2, "INVALID_PATH");
+        amounts = new uint256[](path.length);
+        amounts[amounts.length - 1] = amtOut;
+        for (uint256 i = path.length - 1; i > 0; i--) {
+            (uint256 rIn, uint256 rOut) = _getReserves(path[i-1], path[i]);
+            amounts[i-1] = getAmountIn(amounts[i], rIn, rOut);
+        }
+        require(amounts[0] <= amtInMax, "EXCESSIVE_INPUT");
+        IERC20(path[0]).transferFrom(
+            msg.sender,
+            _getPair(path[0], path[1]),
+            amounts[0]
+        );
+        _swap(amounts, path, to);
+    }
+
+    function _swap(uint256[] memory amounts, address[] memory path, address to) internal {
+        for (uint256 i; i < path.length - 1; i++) {
+            (address input, address output) = (path[i], path[i+1]);
+            (address t0,) = input < output ? (input, output) : (output, input);
+            uint256 amtOut = amounts[i+1];
+            (uint256 out0, uint256 out1) = input == t0 ? (uint256(0), amtOut) : (amtOut, uint256(0));
+            address nextTo = i < path.length - 2
+                ? _getPair(output, path[i+2])
+                : to;
+            RobinhoodPair(_getPair(input, output)).swap(out0, out1, nextTo);
+        }
+    }
+
+    // ── View helpers ──────────────────────────────────────────
+
+    function getPairInfo(address tokenA, address tokenB)
+        external view
+        returns (address pair, uint256 reserveA, uint256 reserveB, uint256 totalSupply)
+    {
+        pair = _getPair(tokenA, tokenB);
+        if (pair == address(0)) return (address(0), 0, 0, 0);
+        (reserveA, reserveB) = _getReserves(tokenA, tokenB);
+        totalSupply = RobinhoodPair(pair).totalSupply();
+    }
+
+    function getPrice(address tokenIn, address tokenOut)
+        external view
+        returns (uint256 price)
+    {
+        (uint256 rIn, uint256 rOut) = _getReserves(tokenIn, tokenOut);
+        require(rIn > 0, "NO_LIQUIDITY");
+        price = (rOut * 1e18) / rIn;
+    }
+}
