@@ -6,7 +6,7 @@ AMM DEX built on Robinhood Chain Testnet — Uniswap V2-style swap, liquidity po
 > deployed on Robinhood Chain Testnet (Chain ID: 46630)
 
 ## Live Demo
-🌐 [novadex.netlify.app](https://novadex.netlify.app)
+🌐 [novadex.netlify.app](https://novasdex.netlify.app)
 
 ## Overview
 NovaDEX is a fully on-chain decentralized exchange built 
